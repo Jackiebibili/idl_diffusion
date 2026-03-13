@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # IDL S26 - Guided Project: Diffusion
 
 # Starter Code Usage
