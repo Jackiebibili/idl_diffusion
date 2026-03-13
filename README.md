@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # IDL S26 - Guided Project: Diffusion
 
 # Starter Code Usage
@@ -107,3 +108,7 @@ generate_submission_from_tensors(all_images, output_csv="submission.csv")
 ```
 
 This extracts Inception-v3 pool3 features, computes mean and covariance, and writes the CSV. Upload the CSV to the Kaggle InClass competition page.
+=======
+# idl_diffusion
+IDL S26 diffusion project
+>>>>>>> 5cc0065b7d467a16df1481ec0c208f8008615012
