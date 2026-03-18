@@ -1,27 +1,26 @@
-
 from typing import List, Optional, Tuple, Union
 from PIL import Image
 from tqdm import tqdm
-import torch 
+import torch
 import torch.nn as nn
 from utils import randn_tensor
-
 
 
 class DDPMPipeline:
     def __init__(self, unet, scheduler, vae=None, class_embedder=None):
         self.unet = unet
         self.scheduler = scheduler
-        
+
         # NOTE: this is for latent DDPM
         self.vae = None
         if vae is not None:
             self.vae = vae
-            
+
         # NOTE: this is for CFG
         if class_embedder is not None:
             self.class_embedder = class_embedder
 
+    # convert numpy image to PIL image for visualization
     def numpy_to_pil(self, images):
         """
         Convert a numpy image or a batch of images to a PIL image.
@@ -52,88 +51,91 @@ class DDPMPipeline:
         else:
             raise ValueError("Either `total` or `iterable` has to be defined.")
 
-    
     @torch.no_grad()
     def __call__(
-        self, 
+        self,
         batch_size: int = 1,
         num_inference_steps: int = 1000,
         classes: Optional[Union[int, List[int]]] = None,
-        guidance_scale : Optional[float] = None,
+        guidance_scale: Optional[float] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        device = None,
+        device=None,
     ):
-        image_shape = (batch_size, self.unet.input_ch, self.unet.input_size, self.unet.input_size)
+        image_shape = (
+            batch_size,
+            self.unet.input_ch,
+            self.unet.input_size,
+            self.unet.input_size,
+        )
         if device is None:
             device = next(self.unet.parameters()).device
-        
+
+        use_cfg = guidance_scale is not None and guidance_scale != 1.0
+
         # NOTE: this is for CFG
-        if classes is not None or guidance_scale is not None:
+        if use_cfg:
             assert hasattr(self, "class_embedder"), "class_embedder is not defined"
-        
+
         if classes is not None:
             # convert classes to tensor
             if isinstance(classes, int):
                 classes = [classes] * batch_size
-            elif isinstance(classes, list):
-                assert len(classes) == batch_size, "Length of classes must be equal to batch_size"
-                classes = torch.tensor(classes, device=device)
-            
-            # TODO: get uncond classes
-            uncond_classes = None 
-            # TODO: get class embeddings from classes
-            class_embeds = None 
-            # TODO: get uncon class embeddings
-            uncond_embeds = None 
-        
-        # TODO: starts with random noise
-        image = None # randn_tensor(image_shape, generator=generator, device=device)
 
-        # TODO: set step values using set_timesteps of scheduler
-        self.scheduler = None
-        
+            if isinstance(classes, list):
+                assert (
+                    len(classes) == batch_size
+                ), "Length of classes must be equal to batch_size"
+                classes = torch.tensor(classes, device=device)  # type: ignore
+
+            # TODO: get uncond classes
+            uncond_classes = None
+            # TODO: get class embeddings from classes
+            class_embeds = None
+            # TODO: get uncon class embeddings
+            uncond_embeds = None
+
+        # starts with random noise
+        image = randn_tensor(image_shape, generator=generator, device=device)
+
+        # set step values using set_timesteps of scheduler
+        self.scheduler.set_timesteps(num_inference_steps, device)
+
         # TODO: inverse diffusion process with for loop
         for t in self.progress_bar(self.scheduler.timesteps):
-            
             # NOTE: this is for CFG
-            if guidance_scale is not None or guidance_scale != 1.0:
+            if use_cfg:
                 # TODO: implement cfg
-                model_input = None 
-                c = None 
+                model_input = None
+                c = None
             else:
-                model_input = None 
+                model_input = image
                 # NOTE: leave c as None if you are not using CFG
                 c = None
-            
-            # TODO: 1. predict noise model_output
-            model_output = None
-            
-            if guidance_scale is not None or guidance_scale != 1.0:
+
+            # 1. predict noise model_output
+            model_output = self.unet(model_input, t, c)
+
+            if use_cfg:
                 # TODO: implement cfg
                 uncond_model_output, cond_model_output = model_output.chunk(2)
                 model_output = None
-            
-            # TODO: 2. compute previous image: x_t -> x_t-1 using scheduler
-            image = None 
-            
-        
+
+            # 2. compute previous image: x_t -> x_t-1 using scheduler
+            image = self.scheduler.step(model_output, t, image, generator=generator)
+
         # NOTE: this is for latent DDPM
         # TODO: use VQVAE to get final image
         if self.vae is not None:
             # NOTE: remember to rescale your images
-            image = None 
+            image = None
             # TODO: clamp your images values
-            image = None 
-        
+            image = None
+
         # TODO: return final image, re-scale to [0, 1]
-        image = None 
-        
+        image = (image / 2 + 0.5).clamp(0, 1)  # type: ignore
+
         # convert to PIL images
-        image = image.cpu().permute(0, 2, 3, 1).numpy()
+        image = image.cpu().permute(0, 2, 3, 1).numpy()  # type: ignore
         image = self.numpy_to_pil(image)
-        
+
         return image
-        
-
-
-
