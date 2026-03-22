@@ -199,7 +199,7 @@ class DDPMScheduler(nn.Module):
         self,
         original_samples: torch.Tensor,
         noise: torch.Tensor,
-        timesteps: torch.IntTensor,
+        timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """
         Add noise to the original samples. This function is used to add noise to the original samples at the beginning of each training iteration.
@@ -210,7 +210,7 @@ class DDPMScheduler(nn.Module):
                 The original samples.
             noise (`torch.Tensor`):
                 The noise tensor.
-            timesteps (`torch.IntTensor`):
+            timesteps (`torch.Tensor`):
                 The timesteps.
 
         Return:
