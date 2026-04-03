@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import time
 import numpy as np
 import ruamel.yaml as yaml
 import torch
@@ -20,6 +21,7 @@ from models import UNet, VAE, ClassEmbedder
 from schedulers import DDPMScheduler, DDIMScheduler
 from pipelines import DDPMPipeline
 from utils import (
+    load_checkpoint,
     seed_everything,
     init_distributed_device,
     is_primary,
@@ -48,7 +50,7 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="./data/imagenet100_128x128/train",
+        default="/local/dataset/imagenet100_128x128/train",
         help="data folder",
     )
     parser.add_argument("--image_size", type=int, default=128, help="image size")
@@ -81,7 +83,7 @@ def parse_args():
         "--num_train_timesteps", type=int, default=1000, help="ddpm training timesteps"
     )
     parser.add_argument(
-        "--num_inference_steps", type=int, default=200, help="ddpm inference timesteps"
+        "--num_inference_steps", type=int, default=1000, help="ddpm inference timesteps"
     )
     parser.add_argument(
         "--beta_start", type=float, default=0.0002, help="ddpm beta start"
@@ -146,7 +148,7 @@ def parse_args():
         help="use cfg for conditional (latent) ddpm",
     )
     parser.add_argument(
-        "--cfg_guidance_scale", type=float, default=2.0, help="cfg for inference"
+        "--cfg_guidance_scale", type=float, default=1.0, help="cfg for inference"
     )
 
     # ddim sampler for inference
@@ -383,6 +385,9 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
 
+    # scheduler.set_timesteps(args.num_inference_steps, device)
+    # load_checkpoint(unet, scheduler, vae=vae, class_embedder=class_embedder, checkpoint_path="experiments/exp-2-ddpm/checkpoints/checkpoint_epoch_1.pth")
+
     # training
     for epoch in range(args.num_epochs):
 
@@ -400,7 +405,7 @@ def main():
         unet.train()
         # scheduler
 
-        # TODO: finish this
+        # finish this
         for step, (images, labels) in enumerate(train_loader):
 
             batch_size = images.size(0)
@@ -479,7 +484,8 @@ def main():
         # send unet to evaluation mode
         unet.eval()
         generator = torch.Generator(device=device)
-        generator.manual_seed(epoch + args.seed)
+        ts = int(time.time())
+        generator.manual_seed(ts + args.seed)
 
         # NOTE: this is for CFG
         if args.use_cfg:
@@ -490,7 +496,7 @@ def main():
         else:
             # fill pipeline
             gen_images = pipeline(
-                4, args.num_inference_steps, None, args.cfg_guidance_scale, generator
+                4, 1000, None, args.cfg_guidance_scale, generator
             )
 
         # create a blank canvas for the grid

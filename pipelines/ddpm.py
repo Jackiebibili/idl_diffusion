@@ -131,7 +131,7 @@ class DDPMPipeline:
             # TODO: clamp your images values
             image = None
 
-        # TODO: return final image, re-scale to [0, 1]
+        # return final image, re-scale to [0, 1]
         image = (image / 2 + 0.5).clamp(0, 1)  # type: ignore
 
         # convert to PIL images
