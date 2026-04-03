@@ -116,7 +116,7 @@ class DDPMScheduler(nn.Module):
         return self.num_train_timesteps
 
     # used in inference to get the previous timestep for a given timestep
-    def previous_timestep(self, timestep):
+    def previous_timestep(self, timestep: Union[int, torch.Tensor]) -> int:
         """
         Get the previous timestep for a given timestep.
 
@@ -126,6 +126,9 @@ class DDPMScheduler(nn.Module):
         Return:
             prev_t (`int`): The previous timestep.
         """
+        if isinstance(timestep, torch.Tensor):
+            timestep = int(timestep.item())
+
         # length of steps
         num_inference_steps = (
             self.num_inference_steps
@@ -142,6 +145,7 @@ class DDPMScheduler(nn.Module):
         else:
             # calculate previous timestep
             prev_t = self.timesteps[cur_ts_index + 1]
+            prev_t = int(prev_t.item())
 
         return prev_t
 
@@ -225,28 +229,24 @@ class DDPMScheduler(nn.Module):
         timesteps = timesteps.to(original_samples.device)  # type: ignore
 
         # get sqrt alphas
-        sqrt_alpha_prod = torch.sqrt(alphas_cumprod)
+        sqrt_alpha_prod = torch.sqrt(alphas_cumprod[timesteps])
         while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
             sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
 
         # get sqrt one miucs alphas
-        one_minus_alpha_prod = torch.ones_like(alphas_cumprod) - alphas_cumprod
-        sqrt_one_minus_alpha_prod = torch.sqrt(one_minus_alpha_prod)
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - alphas_cumprod[timesteps])
         while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
         # add noise to the original samples using the formula (14) from https://arxiv.org/pdf/2006.11239.pdf
-        noisy_samples = (
-            sqrt_alpha_prod[timesteps] * original_samples
-            + sqrt_one_minus_alpha_prod[timesteps] * noise
-        )
+        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         return noisy_samples
 
     # used in inference to predict the previous sample from the current sample and model output
     def step(
         self,
         model_output: torch.Tensor,
-        timestep: int,
+        timestep: torch.Tensor,
         sample: torch.Tensor,
         generator=None,
     ) -> torch.Tensor:
@@ -269,7 +269,7 @@ class DDPMScheduler(nn.Module):
                 The predicted previous sample.
         """
 
-        t = timestep
+        t = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
         prev_t = self.previous_timestep(t)
 
         # if prev_t == -1:
