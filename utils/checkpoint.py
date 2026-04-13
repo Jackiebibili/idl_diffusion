@@ -18,9 +18,7 @@ def load_checkpoint(unet, scheduler, vae=None, class_embedder=None, optimizer=No
     if class_embedder is not None and 'class_embedder_state_dict' in checkpoint:
         print("loading class_embedder")
         class_embedder.load_state_dict(checkpoint['class_embedder_state_dict'])
-    
-    
-        
+
 
 def save_checkpoint(unet, scheduler, vae=None, class_embedder=None, optimizer=None, epoch=None, save_dir='checkpoints'):
     if not os.path.exists(save_dir):
@@ -51,10 +49,10 @@ def save_checkpoint(unet, scheduler, vae=None, class_embedder=None, optimizer=No
     print(f"Checkpoint saved at {checkpoint_path}")
     
     # Manage checkpoint history
-    manage_checkpoints(save_dir, keep_last_n=10)
+    manage_checkpoints(save_dir, keep_last_n=3)
 
 
-def manage_checkpoints(save_dir, keep_last_n=10):
+def manage_checkpoints(save_dir, keep_last_n=3):
     # List all checkpoint files in the save directory
     checkpoints = [f for f in os.listdir(save_dir) if f.startswith('checkpoint_epoch_')]
     checkpoints.sort(key=lambda f: int(f.split('_')[-1].split('.')[0]))  # Sort by epoch number

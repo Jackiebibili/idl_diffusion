@@ -56,7 +56,7 @@ def main():
     vae = None
     if args.latent_ddpm:        
         vae = VAE()
-        vae.init_from_ckpt('pretrained/model.ckpt')
+        vae.init_from_ckpt('/local/pretrained/model.ckpt')
         vae.eval()
     # cfg
     class_embedder = None

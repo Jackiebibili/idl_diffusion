@@ -11,7 +11,7 @@ class DDPMPipeline:
         self.unet = unet
         self.scheduler = scheduler
 
-        # NOTE: this is for latent DDPM
+        # this is for latent DDPM
         self.vae = None
         if vae is not None:
             self.vae = vae
@@ -123,13 +123,12 @@ class DDPMPipeline:
             # 2. compute previous image: x_t -> x_t-1 using scheduler
             image = self.scheduler.step(model_output, t, image, generator=generator)
 
-        # NOTE: this is for latent DDPM
-        # TODO: use VQVAE to get final image
+        # this is for latent DDPM
         if self.vae is not None:
-            # NOTE: remember to rescale your images
-            image = None
-            # TODO: clamp your images values
-            image = None
+            # rescale latent image
+            image = self.vae.decode(image / 0.1845)
+            # clamp your images values
+            image = image.clamp(-1, 1)
 
         # return final image, re-scale to [0, 1]
         image = (image / 2 + 0.5).clamp(0, 1)  # type: ignore

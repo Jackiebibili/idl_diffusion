@@ -107,10 +107,13 @@ def parse_args():
     parser.add_argument(
         "--clip_sample_range", type=float, default=1.0, help="clip sample range"
     )
+    parser.add_argument(
+        "--image_in_size", type=int, default=128, help="cropped input image size"
+    )
 
     # unet
     parser.add_argument(
-        "--unet_in_size", type=int, default=128, help="unet input image size"
+        "--unet_in_size", type=int, default=64, help="unet input image size"
     )
     parser.add_argument(
         "--unet_in_ch", type=int, default=3, help="unet input channel size"
@@ -209,7 +212,7 @@ def main():
     # setup dataset
     logger.info("Creating dataset")
     # use transform to normalize your images to [-1, 1]
-    transform = create_transforms(image_size=args.unet_in_size, augment=True)
+    transform = create_transforms(image_size=args.image_in_size, augment=True)
 
     # use image folder for your train dataset
     train_dataset = ImageDataset(args.data_dir, transform=transform, preload=False)
@@ -283,10 +286,9 @@ def main():
     # NOTE: this is for latent DDPM
     vae = None
     if args.latent_ddpm:
-        # TODO:
         vae = VAE()
         # NOTE: do not change this
-        vae.init_from_ckpt("pretrained/model.ckpt")
+        vae.init_from_ckpt("/local/pretrained/model.ckpt")
         vae.eval()
 
     # Note: this is for cfg
@@ -355,7 +357,7 @@ def main():
 
     # setup evaluation pipeline
     # this pipeline is not differentiable and only for evaluation
-    pipeline = DDPMPipeline(unet, scheduler, vae, class_embedder)
+    pipeline = DDPMPipeline(unet, scheduler_wo_ddp, vae, class_embedder)
 
     # dump config file
     if is_primary(args):
@@ -385,8 +387,8 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
 
-    # scheduler.set_timesteps(args.num_inference_steps, device)
-    # load_checkpoint(unet, scheduler, vae=vae, class_embedder=class_embedder, checkpoint_path="experiments/exp-2-ddpm/checkpoints/checkpoint_epoch_1.pth")
+    # reload from checkpoint
+    # load_checkpoint(unet, scheduler_wo_ddp, vae=vae, class_embedder=class_embedder, checkpoint_path="experiments/exp-1-ddpm/checkpoints/checkpoint_epoch_50.pth")
 
     # training
     for epoch in range(args.num_epochs):
@@ -403,9 +405,7 @@ def main():
 
         # set unet and scheduelr to train
         unet.train()
-        # scheduler
 
-        # finish this
         for step, (images, labels) in enumerate(train_loader):
 
             batch_size = images.size(0)
@@ -418,7 +418,7 @@ def main():
             if vae is not None:
                 # use vae to encode images as latents
                 images = vae.encode(images)
-                # NOTE: do not change  this line, this is to ensure the latent has unit std
+                # do not change this line, this is to ensure the latent has unit std
                 images = images * 0.1845
 
             # zero grad optimizer
@@ -449,6 +449,9 @@ def main():
 
             # model prediction
             model_pred = unet(noisy_images, timesteps, class_emb)
+            # print("images shape:", images.shape)
+            # print("noisy_images shape:", noisy_images.shape)
+            # print("model_pred shape:", model_pred.shape)
 
             if args.prediction_type == "epsilon":
                 target = noise
@@ -464,9 +467,9 @@ def main():
 
             # grad clip
             if args.grad_clip:
-                clip_grad_norm_(unet.parameters(), args.clip_sample_range)
+                clip_grad_norm_(unet.parameters(), args.grad_clip)
                 if class_embedder is not None:
-                    clip_grad_norm_(class_embedder.parameters(), args.clip_sample_range)
+                    clip_grad_norm_(class_embedder.parameters(), args.grad_clip)
 
             # step your optimizer
             optimizer.step()
@@ -479,6 +482,9 @@ def main():
                     f"Epoch {epoch+1}/{args.num_epochs}, Step {step}/{num_update_steps_per_epoch}, Loss {loss.item()} ({loss_m.avg})"
                 )
                 wandb_logger.log({"loss": loss_m.avg})
+                wandb_logger.log({"lr": training_scheduler.get_last_lr()[0]})
+
+        training_scheduler.step()
 
         # validation
         # send unet to evaluation mode
@@ -496,7 +502,7 @@ def main():
         else:
             # fill pipeline
             gen_images = pipeline(
-                4, 1000, None, args.cfg_guidance_scale, generator
+                4, args.num_inference_steps, None, args.cfg_guidance_scale, generator
             )
 
         # create a blank canvas for the grid
