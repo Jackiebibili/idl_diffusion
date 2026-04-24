@@ -16,6 +16,11 @@ from utils import seed_everything, load_checkpoint
 
 from train import parse_args
 
+from generate_submission import generate_submission_from_tensors
+
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+
 logger = get_logger(__name__)
 
 
@@ -157,8 +162,6 @@ def main():
     logger.info(f"Generated tensor shape: {gen_tensors.shape}, dtype: {gen_tensors.dtype}")
 
     # ========== Inception Score ==========
-    from torchmetrics.image.fid import FrechetInceptionDistance
-    from torchmetrics.image.inception import InceptionScore
 
     logger.info("Computing Inception Score...")
     is_metric = InceptionScore(feature=2048, normalize=False).to(device)
@@ -208,7 +211,6 @@ def main():
         logger.info(f"FID (vs {NUM_FID_REFERENCE} real): {fid.item():.4f}")
 
     # ========== Kaggle submission CSV ==========
-    from generate_submission import generate_submission_from_tensors
 
     gen_float = gen_tensors.float() / 255.0  # [0, 1]
     generate_submission_from_tensors(
