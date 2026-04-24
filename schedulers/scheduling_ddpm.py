@@ -53,6 +53,8 @@ class DDPMScheduler(nn.Module):
                 self.num_train_timesteps,
                 dtype=torch.float64,
             )
+        elif self.beta_schedule == "cosine":
+            betas = self._cosine_beta_schedule(self.num_train_timesteps)
         else:
             raise NotImplementedError(f"Other beta schedule not implemented.")
         self.register_buffer("betas", betas)
@@ -71,6 +73,27 @@ class DDPMScheduler(nn.Module):
         timesteps = torch.arange(self.num_train_timesteps - 1, -1, -1).long()
         self.register_buffer("timesteps", timesteps)
         self.timestep_to_index = {int(t.item()): i for i, t in enumerate(self.timesteps)}
+
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        """
+        Cosine schedule from Nichol & Dhariwal (Improved DDPM)
+        """
+
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+
+        alphas_cumprod = torch.cos(
+            ((x / timesteps) + s) / (1 + s) * torch.pi / 2
+        ) ** 2
+
+        # normalize so alpha_bar_0 = 1
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+
+        # convert to betas
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+
+        # clamp for numerical stability
+        return torch.clamp(betas, 1e-8, 0.9999)
 
     # use in inference to skip some timesteps for faster inference
     def set_timesteps(
@@ -292,6 +315,12 @@ class DDPMScheduler(nn.Module):
         if self.prediction_type == "epsilon":
             pred_original_sample = (1 / torch.sqrt(alpha_prod_t)) * (
                 sample - torch.sqrt(beta_prod_t) * model_output
+            )
+        elif self.prediction_type == "v_prediction":
+            # x0 = sqrt(alpha_bar_t) * x_t - sqrt(1 - alpha_bar_t) * v
+            pred_original_sample = (
+                torch.sqrt(alpha_prod_t) * sample
+                - torch.sqrt(beta_prod_t) * model_output
             )
         else:
             raise NotImplementedError(
