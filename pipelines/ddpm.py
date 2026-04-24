@@ -87,12 +87,13 @@ class DDPMPipeline:
                 ), "Length of classes must be equal to batch_size"
                 classes = torch.tensor(classes, device=device)  # type: ignore
 
-            # TODO: get uncond classes
-            uncond_classes = None
-            # TODO: get class embeddings from classes
-            class_embeds = None
-            # TODO: get uncon class embeddings
-            uncond_embeds = None
+            # the null / unconditional token lives at index `num_classes`
+            uncond_classes = torch.full_like(
+                classes, self.class_embedder.num_classes
+            )
+            # bypass cond-drop at inference by hitting nn.Embedding directly
+            class_embeds = self.class_embedder.embedding(classes)
+            uncond_embeds = self.class_embedder.embedding(uncond_classes)
 
         # starts with random noise
         image = randn_tensor(image_shape, generator=generator, device=device)
@@ -104,9 +105,9 @@ class DDPMPipeline:
         for t in self.progress_bar(self.scheduler.timesteps):
             # NOTE: this is for CFG
             if use_cfg:
-                # TODO: implement cfg
-                model_input = None
-                c = None
+                # duplicate batch: first half = uncond, second half = cond
+                model_input = torch.cat([image, image], dim=0)
+                c = torch.cat([uncond_embeds, class_embeds], dim=0)
             else:
                 model_input = image
                 # NOTE: leave c as None if you are not using CFG
@@ -116,9 +117,10 @@ class DDPMPipeline:
             model_output = self.unet(model_input, t, c)
 
             if use_cfg:
-                # TODO: implement cfg
                 uncond_model_output, cond_model_output = model_output.chunk(2)
-                model_output = None
+                model_output = uncond_model_output + guidance_scale * (
+                    cond_model_output - uncond_model_output
+                )
 
             # 2. compute previous image: x_t -> x_t-1 using scheduler
             image = self.scheduler.step(model_output, t, image, generator=generator)
