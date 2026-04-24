@@ -4,3 +4,5 @@ tmp/
 experiments/
 wandb/
 /**/__pycache__/
+generated_images/
+submission.csv

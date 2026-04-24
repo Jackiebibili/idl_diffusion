@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import argparse
@@ -69,6 +70,18 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient clip")
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=5000,
+        help="number of linear warmup steps before cosine decay",
+    )
+    parser.add_argument(
+        "--min_lr_ratio",
+        type=float,
+        default=0.01,
+        help="minimum LR as a fraction of the base LR after cosine decay",
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument(
         "--mixed_precision",
@@ -77,6 +90,17 @@ def parse_args():
         choices=["fp16", "bf16", "fp32", "none"],
         help="mixed precision",
     )
+
+    # generating image count
+    parser.add_argument(
+        "--num_gen_images", type=int, default=16, help="number of images to generate for evaluation"
+    )
+
+    parser.add_argument("--min_snr_gamma", type=float, default=2.0, help="gamma for SNR-based loss weighting")
+
+    parser.add_argument("--low_t_prob", type=float, default=0.0)
+    parser.add_argument("--low_t_max", type=int, default=200)
+    parser.add_argument("--low_t_aux_weight", type=float, default=0.2)
 
     # ddpm
     parser.add_argument(
@@ -240,13 +264,14 @@ def main():
     args.total_batch_size = total_batch_size
 
     # setup experiment folder
+    os.makedirs(args.output_dir, exist_ok=True)
+
     if args.run_name is None:
         args.run_name = f"exp-{len(os.listdir(args.output_dir))}"
     else:
         args.run_name = f"exp-{len(os.listdir(args.output_dir))}-{args.run_name}"
     output_dir = os.path.join(args.output_dir, args.run_name)
     save_dir = os.path.join(output_dir, "checkpoints")
-    os.makedirs(args.output_dir, exist_ok=True)
     if is_primary(args):
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(save_dir, exist_ok=True)
@@ -294,8 +319,9 @@ def main():
     # Note: this is for cfg
     class_embedder = None
     if args.use_cfg:
-        # TODO:
-        class_embedder = ClassEmbedder(None)
+        class_embedder = ClassEmbedder(
+            embed_dim=args.unet_ch, n_classes=args.num_classes
+        )
 
     # send to device
     unet = unet.to(device)
@@ -306,17 +332,45 @@ def main():
         class_embedder = class_embedder.to(device)
 
     # setup optimizer
+    params = list(unet.parameters())
+    if class_embedder is not None:
+        params += list(class_embedder.parameters())
+
     optimizer = torch.optim.AdamW(
-        unet.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        params,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
     )
-    # setup scheduler
-    training_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.num_epochs
-    )
+    # # setup scheduler
+    # training_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, T_max=args.num_epochs
+    # )
 
     # max train steps
     num_update_steps_per_epoch = len(train_loader)
     args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
+
+    # setup scheduler: linear warmup -> cosine decay (step-based)
+    def lr_lambda(current_step: int):
+        warmup_steps = max(0, args.lr_warmup_steps)
+        min_lr_ratio = max(0.0, min(1.0, args.min_lr_ratio))
+
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+
+        if args.max_train_steps <= warmup_steps:
+            return 1.0
+
+        progress = float(current_step - warmup_steps) / float(
+            max(1, args.max_train_steps - warmup_steps)
+        )
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    training_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lr_lambda
+    )
 
     #  setup distributed training
     if args.distributed:
@@ -388,8 +442,14 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
 
     # reload from checkpoint
-    # load_checkpoint(unet, scheduler_wo_ddp, vae=vae, class_embedder=class_embedder, checkpoint_path="experiments/exp-1-ddpm/checkpoints/checkpoint_epoch_50.pth")
+    load_checkpoint(unet, scheduler_wo_ddp, vae=vae, class_embedder=class_embedder, checkpoint_path="experiments/exp-2-ddpm-cfg/checkpoints/checkpoint_epoch_151.pth")
 
+    generator = torch.Generator(device=device)
+    # ts = int(time.time())
+    # same seed for image checking horizontally across epochs
+    generator.manual_seed(args.seed)
+    classes = torch.randint(0, args.num_classes, (args.num_gen_images,), generator=generator, device=device)
+    
     # training
     for epoch in range(args.num_epochs):
 
@@ -402,6 +462,9 @@ def main():
             logger.info(f"Epoch {epoch+1}/{args.num_epochs}")
 
         loss_m = AverageMeter()
+        bucket_0_199 = AverageMeter()
+        bucket_200_599 = AverageMeter()
+        bucket_600_999 = AverageMeter()
 
         # set unet and scheduelr to train
         unet.train()
@@ -421,96 +484,262 @@ def main():
                 # do not change this line, this is to ensure the latent has unit std
                 images = images * 0.1845
 
+            # one-time sanity check: verify UNet input shape matches config
+            if epoch == 0 and step == 0:
+                b, c, h, w = images.shape
+                logger.info(
+                    f"[Sanity] UNet input tensor shape after preprocessing: {images.shape}"
+                )
+                if c != args.unet_in_ch:
+                    raise ValueError(
+                        f"Channel mismatch: tensor C={c}, but args.unet_in_ch={args.unet_in_ch}. "
+                        f"Fix config or preprocessing/VAE output channels."
+                    )
+                if (h, w) != (args.unet_in_size, args.unet_in_size):
+                    raise ValueError(
+                        f"Spatial mismatch: tensor HxW=({h}, {w}), but args.unet_in_size={args.unet_in_size}. "
+                        f"Fix config or preprocessing/VAE downsampling."
+                    )
+
             # zero grad optimizer
             optimizer.zero_grad()
 
             # NOTE: this is for CFG
             if class_embedder is not None:
-                # TODO: use class embedder to get class embeddings
-                class_emb = None
+                # use class embedder to get class embeddings
+                class_emb = class_embedder(labels)
             else:
-                # NOTE: if not cfg, set class_emb to None
+                # set class_emb to None
                 class_emb = None
 
             # sample noise
             noise = torch.randn_like(images)
 
             # sample timestep t
-            timesteps = torch.randint(
-                low=0,
-                high=args.num_train_timesteps,
-                size=(batch_size,),
-                device=device,
-                dtype=torch.long,
-            )
+            if args.low_t_prob > 0:
+                # base: uniform over all timesteps
+                timesteps_full = torch.randint(
+                    low=0,
+                    high=args.num_train_timesteps,
+                    size=(batch_size,),
+                    device=device,
+                    dtype=torch.long,
+                )
+
+                # low-t candidates
+                timesteps_low = torch.randint(
+                    low=0,
+                    high=args.low_t_max,
+                    size=(batch_size,),
+                    device=device,
+                    dtype=torch.long,
+                )
+
+                # choose which samples use low-t
+                choose_low = torch.rand(batch_size, device=device) < args.low_t_prob
+
+                timesteps = torch.where(choose_low, timesteps_low, timesteps_full)
+            else:
+                timesteps = torch.randint(
+                    low=0,
+                    high=args.num_train_timesteps,
+                    size=(batch_size,),
+                    device=device,
+                    dtype=torch.long,
+                )
 
             # add noise to images using scheduler
             noisy_images = scheduler.add_noise(images, noise, timesteps)
 
             # model prediction
             model_pred = unet(noisy_images, timesteps, class_emb)
-            # print("images shape:", images.shape)
-            # print("noisy_images shape:", noisy_images.shape)
-            # print("model_pred shape:", model_pred.shape)
 
             if args.prediction_type == "epsilon":
                 target = noise
+            elif args.prediction_type == "v_prediction":
+                alphas_cumprod = scheduler.alphas_cumprod.to(
+                    device=images.device, dtype=images.dtype
+                )
+                alpha_bar_t = alphas_cumprod[timesteps]
 
-            # calculate loss
-            loss = F.mse_loss(model_pred, target)
+                sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
 
-            # record loss
-            loss_m.update(loss.item())
+                while len(sqrt_alpha_bar_t.shape) < len(images.shape):
+                    sqrt_alpha_bar_t = sqrt_alpha_bar_t.unsqueeze(-1)
+                    sqrt_one_minus_alpha_bar_t = sqrt_one_minus_alpha_bar_t.unsqueeze(-1)
 
-            # backward and step
+                # v = sqrt(alpha_bar_t) * eps - sqrt(1 - alpha_bar_t) * x0
+                target = sqrt_alpha_bar_t * noise - sqrt_one_minus_alpha_bar_t * images
+            else:
+                raise ValueError(f"Unsupported prediction_type: {args.prediction_type}")
+
+            # per-sample loss
+            per_sample_loss = F.mse_loss(model_pred, target, reduction="none")
+            per_sample_loss = per_sample_loss.mean(dim=(1, 2, 3))  # [B]
+
+            alphas_cumprod = scheduler.alphas_cumprod.to(
+                device=images.device, dtype=images.dtype
+            )
+            alpha_bar_t = alphas_cumprod[timesteps]
+            snr = alpha_bar_t / (torch.clamp(1.0 - alpha_bar_t, min=1e-8))
+
+            if args.prediction_type == "epsilon":
+                weights = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma)) / snr
+            elif args.prediction_type == "v_prediction":
+                weights = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma)) / (snr + 1.0)
+            else:
+                raise ValueError(f"Unsupported prediction_type: {args.prediction_type}")
+            # weights = torch.ones_like(per_sample_loss)
+
+            weighted_per_sample_loss = weights * per_sample_loss
+            loss = weighted_per_sample_loss.mean()
+
+            low_aux_mask = timesteps < args.low_t_max
+
+            if low_aux_mask.any():
+                low_aux_loss = per_sample_loss[low_aux_mask].mean()
+                loss = loss + args.low_t_aux_weight * low_aux_loss
+
+            # total loss for backward
+            # loss = per_sample_loss.mean()
+            loss_m.update(loss.item(), batch_size)
+
+            # timestep bucket logging
+            mask_0_199 = (timesteps >= 0) & (timesteps <= 199)
+            mask_200_599 = (timesteps >= 200) & (timesteps <= 599)
+            mask_600_999 = (timesteps >= 600) & (timesteps <= 999)
+
+            if mask_0_199.any():
+                bucket_0_199.update(
+                    per_sample_loss[mask_0_199].mean().item(),
+                    int(mask_0_199.sum().item())
+                )
+
+            if mask_200_599.any():
+                bucket_200_599.update(
+                    per_sample_loss[mask_200_599].mean().item(),
+                    int(mask_200_599.sum().item())
+                )
+
+            if mask_600_999.any():
+                bucket_600_999.update(
+                    per_sample_loss[mask_600_999].mean().item(),
+                    int(mask_600_999.sum().item())
+                )
+
+            # backward
             loss.backward()
 
             # grad clip
-            if args.grad_clip:
-                clip_grad_norm_(unet.parameters(), args.grad_clip)
-                if class_embedder is not None:
-                    clip_grad_norm_(class_embedder.parameters(), args.grad_clip)
+            # if args.grad_clip:
+            #     clip_grad_norm_(unet.parameters(), args.grad_clip)
+            #     if class_embedder is not None:
+            #         clip_grad_norm_(class_embedder.parameters(), args.grad_clip)
 
             # step your optimizer
             optimizer.step()
+            training_scheduler.step() # per step
 
             progress_bar.update(1)
 
-            # logger
+            # loss logging
             if step % 100 == 0 and is_primary(args):
-                logger.info(
-                    f"Epoch {epoch+1}/{args.num_epochs}, Step {step}/{num_update_steps_per_epoch}, Loss {loss.item()} ({loss_m.avg})"
-                )
-                wandb_logger.log({"loss": loss_m.avg})
-                wandb_logger.log({"lr": training_scheduler.get_last_lr()[0]})
+                global_step = epoch * num_update_steps_per_epoch + step
 
-        training_scheduler.step()
+                log_dict = {
+                    "train/loss": loss_m.avg,
+                    "train/lr": training_scheduler.get_last_lr()[0],
+                    "train_bucket/raw_0_199": bucket_0_199.avg,
+                    "train_bucket/raw_200_599": bucket_200_599.avg,
+                    "train_bucket/raw_600_999": bucket_600_999.avg,
+                }
+
+                logger.info(
+                    f"Epoch {epoch+1}/{args.num_epochs}, Step {step}/{num_update_steps_per_epoch}, "
+                    f"Loss {loss.item():.6f} ({loss_m.avg:.6f}), "
+                    f"raw [0-199] {bucket_0_199.avg:.6f}, "
+                    f"raw [200-599] {bucket_200_599.avg:.6f}, "
+                    f"raw [600-999] {bucket_600_999.avg:.6f}"
+                )
+
+                low_mask = (timesteps >= 0) & (timesteps <= 199)
+                if low_mask.any():
+                    low_pred = model_pred[low_mask]
+                    low_target = target[low_mask]
+                    low_cos = F.cosine_similarity(
+                        low_pred.reshape(low_pred.size(0), -1),
+                        low_target.reshape(low_target.size(0), -1),
+                        dim=1
+                    ).mean().item()
+
+                    log_dict.update({
+                        "train_diag/low_pred_std": low_pred.std().item(),
+                        "train_diag/low_target_std": low_target.std().item(),
+                        "train_diag/low_cos": low_cos,
+                    })
+
+                    logger.info(
+                        f"low-t pred std={low_pred.std().item():.4f}, "
+                        f"target std={low_target.std().item():.4f}, "
+                        f"cos={low_cos:.4f}"
+                    )
+
+                high_mask = (timesteps >= 600) & (timesteps <= 999)
+                if high_mask.any():
+                    high_pred = model_pred[high_mask]
+                    high_target = target[high_mask]
+                    high_cos = F.cosine_similarity(
+                        high_pred.reshape(high_pred.size(0), -1),
+                        high_target.reshape(high_target.size(0), -1),
+                        dim=1
+                    ).mean().item()
+
+                    log_dict.update({
+                        "train_diag/high_pred_std": high_pred.std().item(),
+                        "train_diag/high_target_std": high_target.std().item(),
+                        "train_diag/high_cos": high_cos,
+                    })
+
+                    logger.info(
+                        f"high-t pred std={high_pred.std().item():.4f}, "
+                        f"target std={high_target.std().item():.4f}, "
+                        f"cos={high_cos:.4f}"
+                    )
+
+                wandb_logger.log(log_dict, step=global_step)
+
 
         # validation
         # send unet to evaluation mode
         unet.eval()
-        generator = torch.Generator(device=device)
-        ts = int(time.time())
-        generator.manual_seed(ts + args.seed)
 
         # NOTE: this is for CFG
         if args.use_cfg:
-            # random sample 4 classes
-            classes = torch.randint(0, args.num_classes, (4,), device=device)
-            # TODO: fill pipeline
-            gen_images = pipeline(None)
-        else:
-            # fill pipeline
             gen_images = pipeline(
-                4, args.num_inference_steps, None, args.cfg_guidance_scale, generator
+                batch_size=args.num_gen_images,
+                num_inference_steps=args.num_inference_steps,
+                classes=classes,
+                guidance_scale=args.cfg_guidance_scale,
+                generator=generator,
+            )
+        else:
+            gen_images = pipeline(
+                args.num_gen_images,
+                args.num_inference_steps,
+                None,
+                args.cfg_guidance_scale,
+                generator,
             )
 
         # create a blank canvas for the grid
-        grid_image = Image.new("RGB", (4 * args.image_size, 1 * args.image_size))
+        width_count = 8
+        height_count = args.num_gen_images // width_count
+        grid_image = Image.new("RGB", (width_count * args.image_size, height_count * args.image_size))
         # paste images into the grid
         for i, image in enumerate(gen_images):
-            x = (i % 4) * args.image_size
-            y = 0
+            x = (i % width_count) * args.image_size
+            y = (i // width_count) * args.image_size
             grid_image.paste(image, (x, y))
 
         # Send to wandb
@@ -523,7 +752,7 @@ def main():
                 unet_wo_ddp,
                 scheduler_wo_ddp,
                 vae_wo_ddp,
-                class_embedder,
+                class_embedder_wo_ddp,
                 optimizer,
                 epoch,
                 save_dir=save_dir,

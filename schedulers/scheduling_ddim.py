@@ -108,6 +108,18 @@ class DDIMScheduler(DDPMScheduler):
                 sample - torch.sqrt(beta_prod_t) * model_output
             ) / torch.sqrt(alpha_prod_t)
             pred_epsilon = model_output
+        elif self.prediction_type == "v_prediction":
+            # x0 = sqrt(alpha_bar_t) * x_t - sqrt(1 - alpha_bar_t) * v
+            pred_original_sample = (
+                torch.sqrt(alpha_prod_t) * sample
+                - torch.sqrt(beta_prod_t) * model_output
+            )
+
+            # eps = sqrt(alpha_bar_t) * v + sqrt(1 - alpha_bar_t) * x_t
+            pred_epsilon = (
+                torch.sqrt(alpha_prod_t) * model_output
+                + torch.sqrt(beta_prod_t) * sample
+            )
         else:
             raise NotImplementedError(
                 f"Prediction type {self.prediction_type} not implemented."
